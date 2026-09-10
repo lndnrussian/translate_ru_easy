@@ -1,13 +1,37 @@
 import express from "express";
 import path from "path";
+import crypto from "crypto";
 import dotenv from "dotenv";
+import { rateLimit } from "express-rate-limit";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import {
+  buildTranslatePrompt,
+  buildReviewPrompt,
+  buildWordAlternativesPrompt,
+} from "./src/prompts";
 
 dotenv.config();
 
+// Ensure master password is configured in the environment
+const rawAppPassword = process.env.APP_PASSWORD?.trim();
+if (!rawAppPassword) {
+  console.error("APP_PASSWORD не задан в .env — сервер не может стартовать без пароля");
+  process.exit(1);
+}
+const MASTER_PASSWORD: string = rawAppPassword;
+
+// Maximum allowed input text lengths for Gemini API requests
+const MAX_TRANSLATE_TEXT_LENGTH = 20000;
+const MAX_REVIEW_TEXT_LENGTH = 20000;
+const MAX_WORD_ALTERNATIVES_TEXT_LENGTH = 5000;
+
 const app = express();
 const PORT = 3000;
+
+// Enable trust proxy because the app runs behind Cloud Run / reverse proxies.
+// This allows express-rate-limit and req.ip to accurately identify clients from X-Forwarded-For headers.
+app.set("trust proxy", 1);
 
 app.use(express.json({ limit: "10mb" }));
 
@@ -29,27 +53,80 @@ function getGeminiClient(): GoogleGenAI {
 
 // Helper to parse Gemini errors into human-friendly messages and appropriate HTTP status codes
 function parseGeminiError(error: any): { statusCode: number; userMessage: string } {
-  const rawMsg = error?.message || String(error || "");
-  let errorObj: any = null;
-  try {
-    const jsonMatch = rawMsg.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      errorObj = JSON.parse(jsonMatch[0]);
+  let code: number | undefined = undefined;
+  let status: string = "";
+  let innerMsg: string = "";
+  let resolvedStructured = false;
+
+  // 1) First check if the error object has direct structured fields from @google/genai SDK
+  if (error && typeof error === "object") {
+    if (typeof error.status === "number") {
+      code = error.status;
+      resolvedStructured = true;
+    } else if (typeof error.statusCode === "number") {
+      code = error.statusCode;
+      resolvedStructured = true;
+    } else if (typeof error.code === "number") {
+      code = error.code;
+      resolvedStructured = true;
+    } else if (typeof error.status === "string" && error.status.trim().length > 0) {
+      status = error.status.trim();
+      resolvedStructured = true;
     }
-  } catch {
-    // Ignore JSON parsing errors
+
+    if (error.error && typeof error.error === "object") {
+      if (typeof error.error.code === "number") {
+        code = error.error.code;
+        resolvedStructured = true;
+      }
+      if (typeof error.error.status === "string") {
+        status = error.error.status;
+        resolvedStructured = true;
+      }
+      if (typeof error.error.message === "string") {
+        innerMsg = error.error.message;
+        resolvedStructured = true;
+      }
+    }
+
+    if (!innerMsg && typeof error.message === "string") {
+      innerMsg = error.message;
+      if (!resolvedStructured && (code !== undefined || status)) {
+        resolvedStructured = true;
+      }
+    }
   }
 
-  const code = errorObj?.error?.code || error?.status || error?.statusCode || 500;
-  const status = errorObj?.error?.status || "";
-  const innerMsg = errorObj?.error?.message || rawMsg;
+  // 2) Fallback: try parsing JSON embedded in raw message via regex if structured fields weren't found
+  const rawMsg = typeof error?.message === "string" ? error.message : String(error || "");
+  if (!resolvedStructured) {
+    try {
+      const jsonMatch = rawMsg.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (parsed?.error) {
+          if (typeof parsed.error.code === "number") code = parsed.error.code;
+          if (typeof parsed.error.status === "string") status = parsed.error.status;
+          if (typeof parsed.error.message === "string") innerMsg = parsed.error.message;
+          resolvedStructured = true;
+        }
+      }
+    } catch {
+      // Ignore JSON parsing errors
+    }
+  }
 
+  const effectiveCode = code ?? 500;
+  const effectiveStatus = status;
+  const effectiveMsg = innerMsg || rawMsg;
+
+  // Check 503 / Service Unavailable / High demand
   if (
-    code === 503 ||
-    status === "UNAVAILABLE" ||
-    innerMsg.includes("high demand") ||
-    innerMsg.includes("overloaded") ||
-    innerMsg.includes("temporary")
+    effectiveCode === 503 ||
+    effectiveStatus === "UNAVAILABLE" ||
+    effectiveMsg.includes("high demand") ||
+    effectiveMsg.includes("overloaded") ||
+    effectiveMsg.includes("temporary")
   ) {
     return {
       statusCode: 503,
@@ -58,7 +135,13 @@ function parseGeminiError(error: any): { statusCode: number; userMessage: string
     };
   }
 
-  if (code === 429 || status === "RESOURCE_EXHAUSTED" || innerMsg.includes("RESOURCE_EXHAUSTED")) {
+  // Check 429 / Rate Limit / Resource Exhausted
+  if (
+    effectiveCode === 429 ||
+    effectiveStatus === "RESOURCE_EXHAUSTED" ||
+    effectiveMsg.includes("RESOURCE_EXHAUSTED") ||
+    effectiveMsg.includes("quota")
+  ) {
     return {
       statusCode: 429,
       userMessage:
@@ -66,16 +149,29 @@ function parseGeminiError(error: any): { statusCode: number; userMessage: string
     };
   }
 
-  if (code === 400 || status === "INVALID_ARGUMENT") {
+  // Check 400 / Invalid Argument
+  if (effectiveCode === 400 || effectiveStatus === "INVALID_ARGUMENT") {
     return {
       statusCode: 400,
-      userMessage: `Некорректный запрос к модели: ${innerMsg}`,
+      userMessage: innerMsg
+        ? `Некорректный запрос к модели: ${innerMsg}`
+        : "Некорректный запрос к модели.",
+    };
+  }
+
+  // 3) If neither structured parsing nor regex identified a known status/message, return 500 with user-friendly text
+  if (!resolvedStructured) {
+    return {
+      statusCode: 500,
+      userMessage: "Не удалось обработать ответ модели. Попробуйте повторить запрос.",
     };
   }
 
   return {
-    statusCode: typeof code === "number" && code >= 400 && code < 600 ? code : 500,
-    userMessage: innerMsg.length > 250 ? `${innerMsg.slice(0, 250)}...` : innerMsg,
+    statusCode: typeof effectiveCode === "number" && effectiveCode >= 400 && effectiveCode < 600 ? effectiveCode : 500,
+    userMessage: innerMsg
+      ? (innerMsg.length > 250 ? `${innerMsg.slice(0, 250)}...` : innerMsg)
+      : "Не удалось обработать ответ модели. Попробуйте повторить запрос.",
   };
 }
 
@@ -192,15 +288,47 @@ async function generateContentWithRetryAndFallback(
   throw lastError;
 }
 
-// Master password configuration for single-user security
-const MASTER_PASSWORD = process.env.APP_PASSWORD?.trim() || "london2026";
+// Timing-safe password comparison helper using crypto.timingSafeEqual
+function safePasswordCompare(inputCandidate?: string): boolean {
+  if (!inputCandidate || typeof inputCandidate !== "string") {
+    return false;
+  }
+  const candidateBuf = Buffer.from(inputCandidate, "utf-8");
+  const masterBuf = Buffer.from(MASTER_PASSWORD, "utf-8");
+
+  if (candidateBuf.length !== masterBuf.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(candidateBuf, masterBuf);
+}
+
+// Rate limiter for authentication endpoints: max 5 failed attempts per 15 min per IP.
+// Successful requests are not counted against the limit.
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 failed attempts per window
+  skipSuccessfulRequests: true, // Successful logins are not counted against the quota
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: {
+    trustProxy: true,
+    forwardedHeader: false, // Prevents warning when running behind proxies providing both Forwarded and X-Forwarded-For
+  },
+  handler: (_req, res) => {
+    res.status(429).json({
+      error: "Слишком много попыток входа. Попробуйте позже.",
+      statusCode: 429,
+    });
+  },
+});
 
 // Auth Verification Middleware
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.headers["x-app-password"] as string);
 
-  if (!token || token !== MASTER_PASSWORD) {
+  if (!token || !safePasswordCompare(token)) {
     return res.status(401).json({
       error: "Доступ ограничен. Требуется авторизация персонального переводчика.",
       requiresAuth: true,
@@ -209,10 +337,10 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   next();
 }
 
-// Auth status & login verification endpoint
-app.post("/api/auth/verify", (req, res) => {
+// Auth status & login verification endpoint (Protected against brute-force)
+app.post("/api/auth/verify", authRateLimiter, (req, res) => {
   const { password } = req.body || {};
-  if (!password || password !== MASTER_PASSWORD) {
+  if (!password || !safePasswordCompare(password)) {
     return res.status(401).json({
       success: false,
       error: "Неверный пароль доступа.",
@@ -224,11 +352,19 @@ app.post("/api/auth/verify", (req, res) => {
   });
 });
 
-// Quick check if password is required and valid
-app.get("/api/auth/status", (req, res) => {
+// Quick check if password is required and valid (Protected against brute-force)
+app.get("/api/auth/status", authRateLimiter, (req, res) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.headers["x-app-password"] as string);
-  const isAuthenticated = Boolean(token && token === MASTER_PASSWORD);
+  const isAuthenticated = safePasswordCompare(token);
+  if (!isAuthenticated && token) {
+    // If an invalid token was supplied in the request, respond with 401 so rateLimit registers it as a failed attempt
+    return res.status(401).json({
+      protected: true,
+      authenticated: false,
+      error: "Недействительный токен.",
+    });
+  }
   res.json({
     protected: true,
     authenticated: isAuthenticated,
@@ -271,108 +407,33 @@ app.post("/api/translate", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Input text is required." });
     }
 
+    if (text.length > MAX_TRANSLATE_TEXT_LENGTH) {
+      return res.status(400).json({
+        error: `Текст слишком длинный. Максимум ${MAX_TRANSLATE_TEXT_LENGTH} символов за один запрос.`,
+      });
+    }
+
     const ai = getGeminiClient();
 
     // Model selection validation
     const allowedModels = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.1-pro-preview"];
     const chosenModel = allowedModels.includes(model) ? model : "gemini-3.1-flash-lite";
 
-    // Build system instructions for professional translator
-    const systemInstruction = `You are a World-Class Master Senior Translator, Literary Editor, and Localizer specializing exclusively in Russian and English translations (in both directions).
-Your task is to produce a high-caliber professional translation that meets rigorous publishing, localization, and copywriting standards.
-
-TRANSLATION DIRECTIVES & CONSTRAINTS:
-
-1. DIRECTION:
-- User selected direction: "${direction}". If "auto", inspect the text: if predominantly Russian Cyrillic, translate to English (ru-en); if predominantly English Latin, translate to Russian (en-ru).
-
-2. REGISTER & TONE:
-- Current Register: "${register}".
-  * formal: Официально-деловой, строгий протокол, юридическая и дипломатическая выверенность, отсутствие разговорных элементов.
-  * neutral: Нейтрально-литературный, взвешенный, ясный, чистый современный литературный язык.
-  * conversational: Живая естественная речь носителя языка, естественные коллокации и фразеологизмы, отсутствие механического калькирования.
-  * literary: Художественный стиль: внимание к ритмике фразы, полифонии, образности, метафорам и аллюзиям.
-  * marketing: Убедительный копирайтинг: броскость, вовлечение, динамичность, адаптация культурных триггеров (транскреация).
-  * technical: Предельная точность терминов, однозначность синтаксиса, стандартная отраслевая номенклатура.
-
-3. TARGET AUDIENCE:
-- Target Audience: "${targetAudience}".
-  * general: Понятный широкому кругу читателей без узкого жаргона.
-  * professional: Экспертный уровень владения профессиональной лексикой.
-  * youth: Молодежная аудитория, живой современный сленг/интернет-лексикон при уместности.
-  * executive: Управленческий уровень, фокус на ценность, стратегичность и лаконичность.
-  * kids: Простые, добрые, образные конструкции, доступные детям.
-
-4. LITERALITY LEVEL (1 to 5):
-- Level: ${literality} / 5.
-  * 1 (Verbatim/Literal): Максимально точное следование синтаксису и порядку слов оригинала, насколько допускают правила целевого языка.
-  * 2 (Close/Faithful): Близко к тексту с минимальной перестройкой структуры.
-  * 3 (Balanced/Professional): Золотой стандарт качественного перевода — передача точного смысла естественными средствами языка перевода.
-  * 4 (Idiomatic/Free): Свободное идиоматическое изложение, приоритет благозвучия и естественности на целевом языке.
-  * 5 (Transcreation): Творческая адаптация духа, настроения и коммуникативного эффекта; свободная переработка формулировок под культурный контекст.
-
-5. GENDER & FORMALITY SPECIFICATIONS (Crucial when translating into Russian):
-- Speaker Gender: "${speakerGender}".
-  * If "male": use masculine past tense and adjectives for first-person (e.g., «я сказал», «я сделал», «я был уверен»).
-  * If "female": use feminine past tense and adjectives for first-person (e.g., «я сказала», «я сделала», «я была уверена»).
-- Addressee Gender: "${addresseeGender}".
-  * If "male": use masculine forms for second-person (e.g., «ты сказал», «ты готов»).
-  * If "female": use feminine forms for second-person (e.g., «ты сказала», «ты готова»).
-- Formality / Address: "${formalityAddress}".
-  * If "formal_vy": use respectful «Вы / Вам / Ваш».
-  * If "informal_ty": use informal «ты / тебе / твой».
-
-6. MANDATORY GLOSSARY:
-${
-  glossary.length > 0
-    ? `The following term correspondences MUST be strictly adhered to:\n` +
-      glossary
-        .map((g: any) => `- "${g.source}" => "${g.target}"${g.comment ? ` (Note: ${g.comment})` : ""}`)
-        .join("\n")
-    : "No custom glossary provided. Use standard industry terms."
-}
-
-7. FORMATTING:
-- Preserve formatting: ${preserveFormatting ? "YES" : "NO"}.
-${preserveFormatting ? "Strictly preserve all Markdown markup (headers, bold/italics, bullet points, links, code blocks) and HTML tags intact without altering tags." : "Output plain text."}
-
-8. TYPOGRAPHIC CONVENTIONS & PUNCTUATION (Russian Academic Standard / D.E. Rosenthal):
-- Russian quotes: Use «ёлочки» for outer quotes and „лапки“ for nested quotes (never plain straight ASCII quotes in Russian).
-- Dash: Use em-dash (—) with a preceding non-breaking space for Russian clauses, dialogues, and definitions.
-- Punctuation with quotes (Rosenthal standard):
-  * When a quoted phrase, term, or sentence is integrated into the larger sentence, the closing punctuation mark (period or comma) belongs to the overall sentence and is placed STRICTLY AFTER the closing quote:
-    - Правильно: Он охарактеризовал это как «очередной провал». (НЕ «...провал.»)
-    - Правильно: В статье «Кризис идей», опубликованной вчера, автор затронул... (НЕ «...идей,» автор)
-  * Never copy the American quotation convention ("word," "word.") into Russian: commas and periods placed before the closing quote are considered a typographic calque defect in Russian.
-  * If the quoted passage is a self-contained sentence ending with its own exclamation mark, question mark, or ellipsis, that mark remains INSIDE the quotes, and NO trailing period is added after the closing quote:
-    - Правильно: Он резко выкрикнул: «Берегись!» (без точки после кавычки)
-    - Правильно: Возник закономерный вопрос: «Что делать дальше?» (без точки после кавычки)
-
-9. TWO-PASS CRITIQUE & REFINE ENGINE (Self-Correction Protocol):
-${
-  selfCorrection
-    ? `You MUST execute a disciplined Two-Pass Linguistic Refinement:
-  - Phase 1 (Draft Translation): First construct a preliminary translation capturing all source information.
-  - Phase 2 (Editorial Self-Correction Audit): Act as a ruthless Senior Chief Editor and inspect the preliminary draft:
-    * Identify any word-for-word calques (синтаксические кальки и неестественный порядок слов).
-    * Detect false friends of the translator (ложные друзья переводчика) and inappropriate literal idioms.
-    * Check rhythm, cadence, and theme-rheme word order (актуальное членение предложения).
-    * Eliminate wooden phrasing, robotic nominalizations, or passive voice overuse in Russian.
-    * Verify glossary compliance and register consistency.
-  - Phase 3 (Final Master Translation): Rewrite and polish the draft into the finalized master text ("translation") integrating all critique points.
-  - Populate "selfCorrection" with:
-    * "enabled": true
-    * "draftTranslation": the preliminary draft
-    * "refinements": list of specific improvements made (aspect: syntax_calque, false_friend, rhythm_cadence, natural_flow, terminology, tone_consistency; issue; resolution)
-    * "editorSummary": brief 1-2 sentence editorial verdict in Russian summarizing the polished improvements.`
-    : `Self-correction is disabled. Directly produce the final translation.`
-}
-
-10. EXPLANATIONS & ALTERNATIVES:
-${explainDecisions ? "- In the decisions field, briefly explain key translation choices (idioms, cultural adaptations, wordplay, false friends, syntax shifts)." : "- You may keep decisions minimal."}
-${provideAlternatives ? "- In the alternatives field, provide 2 to 3 alternative translations for 1 to 3 nuanced phrases in the text, highlighting what tone or nuance each variant carries." : "- Keep alternatives empty if not requested."}
-
-Return the response strictly conforming to the JSON schema.`;
+    // Build system instructions for professional translator using centralized prompt builder
+    const systemInstruction = buildTranslatePrompt({
+      direction,
+      register,
+      targetAudience,
+      literality,
+      speakerGender,
+      addresseeGender,
+      formalityAddress,
+      glossary,
+      preserveFormatting,
+      selfCorrection,
+      explainDecisions,
+      provideAlternatives,
+    });
 
     const prompt = `Translate the following source text:\n\n${text}`;
 
@@ -508,20 +569,18 @@ app.post("/api/review", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Both source text and draft translation are required for comparison." });
     }
 
+    if (sourceText.length > MAX_REVIEW_TEXT_LENGTH || draftText.length > MAX_REVIEW_TEXT_LENGTH) {
+      return res.status(400).json({
+        error: `Текст слишком длинный. Максимум ${MAX_REVIEW_TEXT_LENGTH} символов за один запрос.`,
+      });
+    }
+
     const ai = getGeminiClient();
-    const systemInstruction = `You are a Senior Translation Lead and Chief Quality Editor for RU ↔ EN translations.
-Analyze the provided draft translation against the original source text.
-
-Evaluation criteria:
-1. Accuracy & completeness: any omissions, additions, or distortions of meaning.
-2. Register & Style: how well it adheres to register "${register}" and audience "${targetAudience}".
-3. Idiomaticity & Fluency: natural collocations, avoidance of calques/mechanical translation.
-4. Typography & Punctuation: Russian quotes (« »), em-dash (—), punctuation placement according to Rosenthal academic standard (period/comma strictly after closing quotes, no English-style calques with period/comma inside quotes).
-5. Glossary: Check if any of the following terms were violated:
-${glossary.map((g: any) => `- "${g.source}" => "${g.target}"`).join("\n") || "None"}
-
-Provide an overall rating out of 10, list key strengths, identify specific issues with actionable suggestions, and provide an improved professional revision.
-All reasons and summaries should be written in Russian.`;
+    const systemInstruction = buildReviewPrompt({
+      register,
+      targetAudience,
+      glossary,
+    });
 
     const prompt = `SOURCE TEXT:\n${sourceText}\n\nDRAFT TRANSLATION TO REVIEW:\n${draftText}`;
 
@@ -617,19 +676,23 @@ app.post("/api/word-alternatives", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "A target word or phrase is required." });
     }
 
-    const ai = getGeminiClient();
-    const systemInstruction = `You are an elite DeepL-style contextual vocabulary assistant for Russian and English translations.
-The user clicked the word or phrase "${word}" in the following translated sentence:
-"${sentence || word}"
-${sourceText ? `Original source text for context: "${sourceText}"` : ""}
-Language direction: ${direction}. Register target: ${register}.
+    if (
+      (sentence && sentence.length > MAX_WORD_ALTERNATIVES_TEXT_LENGTH) ||
+      (sourceText && sourceText.length > MAX_WORD_ALTERNATIVES_TEXT_LENGTH)
+    ) {
+      return res.status(400).json({
+        error: `Текст слишком длинный. Максимум ${MAX_WORD_ALTERNATIVES_TEXT_LENGTH} символов за один запрос.`,
+      });
+    }
 
-Your task:
-1. Provide 4 to 6 grammatically aligned contextual alternatives/synonyms for "${word}".
-   - CRITICAL: The alternatives MUST match the exact grammatical form (case, gender, number, tense, aspect, person) required by the sentence structure so the word can be swapped in directly without syntax errors.
-   - Categorize each alternative with a concise Russian tag (e.g., "Нейтрально", "Более формально", "Книжное", "Разговорное", "Деловое", "Литературное", "Лаконично", "Более точное").
-   - Give a concise explanation (in Russian, max 10 words) of the nuance or nuance shift.
-2. Provide 2 alternative rephrasings of the entire sentence ("sentenceRephrasings") showing how the sentence can be rewritten more idiomatically or with different cadence.`;
+    const ai = getGeminiClient();
+    const systemInstruction = buildWordAlternativesPrompt({
+      word,
+      sentence,
+      sourceText,
+      direction,
+      register,
+    });
 
     const prompt = `Selected word/phrase: "${word}"
 Sentence context: "${sentence || word}"`;
